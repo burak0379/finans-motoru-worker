@@ -1,5 +1,5 @@
 /* ════════════════════════════════════════════════════════════════
-   FİNANS MOTORU — Veri Worker v2 (Cloudflare Workers)
+   FİNANS MOTORU — Veri Worker v2.6 (Cloudflare Workers)
    EVDS (TCMB) + Yahoo Finance + TEFAS vekili — CORS köprüsü
 
    KURULUM (bir kez):
@@ -20,6 +20,7 @@
    /seri?code=X&start=YYYY-MM-DD[&end=...]  → tam seri {points:[[tarih,değer]]}
    /yahoo?symbol=THYAO.IS&range=5y&interval=1d → OHLC kapanışları (2. teslimat)
    /tefas?fon=AAK&start=YYYY-MM-DD&end=...     → fon fiyat geçmişi (2. teslimat)
+   /temel?symbol=THYAO.IS → F/K, PD/DD, ROE, marj, borç, temettü (FM-21)
    ════════════════════════════════════════════════════════════════ */
 
 /* ── /paket için son-değer serileri ──
@@ -112,7 +113,62 @@ function yillikYuzde(points) {
   return out;
 }
 
-const SURUM = '2.5-katalog';
+/* ── FM-21: Yahoo quoteSummary temel veri ──
+   Yahoo 2023'ten beri quoteSummary için çerez+crumb ister; ikisini de
+   Worker alır (tarayıcıdan alınamaz — CORS). Crumb izolat ömrünce önbellekte. */
+let YCRUMB = null; // {cookie, crumb, t}
+
+async function yahooCrumb() {
+  if (YCRUMB && Date.now() - YCRUMB.t < 30 * 60000) return YCRUMB;
+  const UA = { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15' };
+  /* 1) çerez: fc.yahoo.com her istekte A3 çerezi bırakır (404 dönmesi normal) */
+  const r1 = await fetch('https://fc.yahoo.com/', { headers: UA, redirect: 'manual' });
+  const cookie = (r1.headers.get('set-cookie') || '').split(',').map(s => s.split(';')[0].trim())
+    .filter(s => /=/.test(s)).join('; ');
+  if (!cookie) throw new Error('Yahoo çerezi alınamadı');
+  /* 2) crumb */
+  const r2 = await fetch('https://query2.finance.yahoo.com/v1/test/getcrumb',
+    { headers: Object.assign({}, UA, { Cookie: cookie, Accept: 'text/plain' }) });
+  const crumb = (await r2.text()).trim();
+  if (!r2.ok || !crumb || crumb.length > 30 || crumb.includes('<'))
+    throw new Error('Yahoo crumb alınamadı (HTTP ' + r2.status + ')');
+  YCRUMB = { cookie, crumb, t: Date.now() };
+  return YCRUMB;
+}
+
+/* quoteSummary yanıtından düz alan sözlüğü — saf fonksiyon, testte sınanır.
+   Yahoo değerleri {raw, fmt} sarmalında gelir; raw alınır. Oranlar %'ye çevrilir. */
+function temelAlanlar(qs) {
+  const g = (mod, alan) => {
+    const m = qs && qs[mod];
+    if (!m) return null;
+    const v = m[alan];
+    if (v === null || v === undefined) return null;
+    const raw = (typeof v === 'object') ? v.raw : v;
+    return isFinite(raw) ? +raw : null;
+  };
+  const yzd = v => v === null ? null : +(v * 100).toFixed(2);
+  const ap = qs && qs.assetProfile, pr = qs && qs.price;
+  const fk1 = g('summaryDetail', 'trailingPE');
+  const ifk = g('summaryDetail', 'forwardPE');
+  return {
+    fk:        fk1,
+    ileriFk:   ifk !== null ? ifk : g('defaultKeyStatistics', 'forwardPE'),
+    pddd:      g('defaultKeyStatistics', 'priceToBook'),
+    roe:       yzd(g('financialData', 'returnOnEquity')),
+    netMarj:   yzd(g('financialData', 'profitMargins')),
+    borcOz:    g('financialData', 'debtToEquity'),            // Yahoo bunu zaten % ölçeğinde verir
+    temettu:   yzd(g('summaryDetail', 'dividendYield')),
+    piyasaDeger: (() => { const a = g('summaryDetail', 'marketCap'); return a !== null ? a : g('price', 'marketCap'); })(),
+    hbk:       g('defaultKeyStatistics', 'trailingEps'),
+    sektor:    (ap && ap.sector) || null,
+    endustri:  (ap && ap.industry) || null,
+    adi:       (pr && (pr.longName || pr.shortName)) || null,
+    paraBirimi:(pr && pr.currency) || null
+  };
+}
+
+const SURUM = '2.6-temel';
 
 export default {
   async fetch(req, env) {
@@ -205,6 +261,31 @@ export default {
         return json({ symbol: sym, currency: res.meta && res.meta.currency, points });
       }
 
+      /* ── /temel: tek hissenin temel oranları (FM-21) — Yahoo quoteSummary ── */
+      if (yol === '/temel') {
+        const sym = url.searchParams.get('symbol');
+        if (!sym) return json({ error: 'symbol parametresi gerekli (ör. THYAO.IS)' }, 400);
+        const moduller = 'summaryDetail,defaultKeyStatistics,financialData,assetProfile,price';
+        let d = null, sonHata = null;
+        for (let deneme = 0; deneme < 2; deneme++) {
+          try {
+            const c = await yahooCrumb();
+            const r = await fetch('https://query2.finance.yahoo.com/v10/finance/quoteSummary/' +
+              encodeURIComponent(sym) + '?modules=' + moduller + '&crumb=' + encodeURIComponent(c.crumb),
+              { headers: { Cookie: c.cookie, 'User-Agent': 'Mozilla/5.0 (finans-motoru)' } });
+            if (r.status === 401 || r.status === 403) {
+              YCRUMB = null; sonHata = 'Yahoo HTTP ' + r.status + ' (crumb yenilendi)'; continue;
+            }
+            if (!r.ok) throw new Error('Yahoo HTTP ' + r.status);
+            d = await r.json(); break;
+          } catch (e) { sonHata = String(e.message || e); YCRUMB = null; }
+        }
+        if (!d) return json({ error: 'temel veri alınamadı · ' + sonHata }, 502);
+        const res = d.quoteSummary && d.quoteSummary.result && d.quoteSummary.result[0];
+        if (!res) return json({ error: (d.quoteSummary && d.quoteSummary.error && d.quoteSummary.error.description) || 'sonuç yok — sembol doğru mu?' }, 404);
+        return json({ symbol: sym, tarih: bugun, alanlar: temelAlanlar(res) });
+      }
+
       /* ── /tefas: fon fiyat geçmişi — 2. teslimat kullanacak (uç deneysel) ── */
       if (yol === '/tefas') {
         const fon = url.searchParams.get('fon');
@@ -238,10 +319,12 @@ export default {
 
       return json({
         durum: 'Finans Motoru Worker', surum: SURUM,
-        uclar: ['/check', '/paket', '/seri?code=&start=', '/gruplar?kelime=', '/liste?grup=', '/yahoo?symbol=', '/tefas?fon=']
+        uclar: ['/check', '/paket', '/seri?code=&start=', '/gruplar?kelime=', '/liste?grup=', '/yahoo?symbol=', '/tefas?fon=', '/temel?symbol=']
       });
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);
     }
   }
 };
+
+
