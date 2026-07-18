@@ -168,7 +168,7 @@ function temelAlanlar(qs) {
   };
 }
 
-const SURUM = '2.7-tefas';
+const SURUM = '2.7.1-tefaskesif';
 
 export default {
   async fetch(req, env) {
@@ -286,6 +286,47 @@ export default {
         return json({ symbol: sym, tarih: bugun, alanlar: temelAlanlar(res) });
       }
 
+      /* ── /tefaskesif: TEFAS sayfa kaynağından API yollarını keşfet (v2.7.1) ──
+         BindHistoryInfo 404 dönünce eklendi: tarihsel veri sayfasının HTML/JS'i
+         içinde geçen /api/... yolları ve POST alan adları dökülür — yeni kontratı
+         buradan okuyup /tefas'ı düzeltiriz (EVDS keşfiyle aynı yöntem). */
+      if (yol === '/tefaskesif') {
+        const UA2 = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15';
+        const adaylar = [
+          'https://www.tefas.gov.tr/TarihselVeriler.aspx',
+          'https://www.tefas.gov.tr/FonKarsilastirma.aspx',
+          'https://www.fundturkey.com.tr/TarihselVeriler.aspx',
+          'https://www.tefas.gov.tr/'
+        ];
+        const out = [];
+        for (const adres of adaylar) {
+          try {
+            const r = await fetch(adres, { headers: { 'User-Agent': UA2 }, redirect: 'follow' });
+            const g = await r.text();
+            const apiler = [...new Set((g.match(/["'\(](\/?api\/[A-Za-z0-9_\/.\-]+)/g) || [])
+              .map(s => s.replace(/^["'\(]/, '')))];
+            const ajaxlar = [...new Set((g.match(/url\s*:\s*["'][^"']+["']/g) || []).map(s => s.slice(0, 120)))];
+            const alanlar = [...new Set((g.match(/name=["'][a-zA-Z]{3,20}["']/g) || []).map(s => s.slice(6, -1)))].slice(0, 40);
+            const scriptler = [...new Set((g.match(/src=["'][^"']*\.js[^"']*["']/g) || []).map(s => s.slice(5, -1)))].slice(0, 15);
+            out.push({ adres, http: r.status, sonUrl: r.url, boyut: g.length,
+              apiYollari: apiler, ajaxUrller: ajaxlar.slice(0, 15), formAlanlari: alanlar, scriptler });
+          } catch (e) { out.push({ adres, hata: String(e.message || e) }); }
+        }
+        return json({ not: 'apiYollari + ajaxUrller yeni kontratın adayları; scriptler içinde de olabilir — /tefaskesif?js=<script-yolu> ile bir betiği tara', sayfalar: out });
+      }
+      /* betik içi tarama: /tefaskesif zaten yol eşleşti — js parametresi varsa üstteki yerine bunu çalıştır */
+      if (yol === '/tefasjs') {
+        const js = url.searchParams.get('js');
+        if (!js) return json({ error: 'js parametresi gerekli (tam URL ya da /path.js)' }, 400);
+        const tam = js.startsWith('http') ? js : 'https://www.tefas.gov.tr' + (js.startsWith('/') ? js : '/' + js);
+        const r = await fetch(tam, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const g = await r.text();
+        const apiler = [...new Set((g.match(/["'](\/?api\/[A-Za-z0-9_\/.\-]+)["']/g) || []).map(s => s.slice(1, -1)))];
+        const urller = [...new Set((g.match(/url\s*:\s*["'][^"']+["']/g) || []).map(s => s.slice(0, 150)))];
+        const datalar = [...new Set((g.match(/data\s*:\s*\{[^}]{0,300}\}/g) || []).map(s => s.slice(0, 300)))].slice(0, 10);
+        return json({ js: tam, http: r.status, boyut: g.length, apiYollari: apiler, urller: urller.slice(0, 20), postGovdeleri: datalar });
+      }
+
       /* ── /tefas: fon fiyat geçmişi (v2.7'de sağlamlaştırıldı) ──
          TEFAS uzun aralığı tek istekte vermez (~3 ay sınırı) → 60 günlük
          dilimlerle çekilip birleştirilir; önce oturum çerezi alınır.
@@ -316,42 +357,58 @@ export default {
           a = new Date(b.getTime() + 864e5);
         }
         if (dilimler.length > 45) return json({ error: 'aralık çok uzun (' + dilimler.length + ' dilim) — start tarihini yakınlaştır' }, 400);
+        const evler = ['https://www.tefas.gov.tr', 'https://www.fundturkey.com.tr'];
+        let ev = null; // çalışan ev sahibi (ilk dilimde bulunur)
         const m = new Map(); const hatalar = [];
+        const dilimCek = async (host, d1, d2) => {
+          const body = new URLSearchParams({
+            fontip: tip, fonkod: fon.toUpperCase(),
+            bastarih: trTarih(d1), bittarih: trTarih(d2)
+          });
+          const hdr = {
+            'User-Agent': UA2,
+            'X-Requested-With': 'XMLHttpRequest',
+            Origin: host,
+            Referer: host + '/TarihselVeriler.aspx'
+          };
+          if (cerez) hdr.Cookie = cerez;
+          const r = await fetch(host + '/api/DB/BindHistoryInfo', { method: 'POST', body, headers: hdr });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return (await r.json()).data || [];
+        };
         for (const [d1, d2] of dilimler) {
           try {
-            const body = new URLSearchParams({
-              fontip: tip, fonkod: fon.toUpperCase(),
-              bastarih: trTarih(d1), bittarih: trTarih(d2)
-            });
-            const hdr = {
-              'User-Agent': UA2,
-              'X-Requested-With': 'XMLHttpRequest',
-              Origin: 'https://www.tefas.gov.tr',
-              Referer: 'https://www.tefas.gov.tr/TarihselVeriler.aspx'
-            };
-            if (cerez) hdr.Cookie = cerez;
-            const r = await fetch('https://www.tefas.gov.tr/api/DB/BindHistoryInfo', { method: 'POST', body, headers: hdr });
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            const d = await r.json();
-            for (const x of (d.data || [])) {
+            let rows = null;
+            if (!ev) { /* ilk dilim: ev sahiplerini sırayla dene */
+              let sonH = null;
+              for (const h of evler) {
+                try { rows = await dilimCek(h, d1, d2); ev = h; break; }
+                catch (e) { sonH = h.replace('https://www.', '') + ' ' + String(e.message || e); }
+              }
+              if (!ev) throw new Error(sonH || 'hiçbir ev sahibi yanıt vermedi');
+            } else {
+              rows = await dilimCek(ev, d1, d2);
+            }
+            for (const x of rows) {
               const t = new Date(+x.TARIH).toISOString().slice(0, 10);
               const v = parseFloat(x.FIYAT);
               if (isFinite(v)) m.set(t, v);
             }
-          } catch (e) { hatalar.push(d1 + '→' + d2 + ': ' + String(e.message || e).slice(0, 60)); }
+          } catch (e) { hatalar.push(d1 + '→' + d2 + ': ' + String(e.message || e).slice(0, 70)); }
         }
         const points = [...m.entries()].sort((x, y) => (x[0] < y[0] ? -1 : 1));
         if (!points.length)
           return json({ error: 'veri yok — kod doğru mu? (' + tip + ' tipi denendi' +
-            (tip === 'YAT' ? '; emeklilik fonuysa &tip=EMK ekle' : '') + ')',
+            (tip === 'YAT' ? '; emeklilik fonuysa &tip=EMK ekle' : '') +
+            '). Uç 404 veriyorsa kontrat değişmiş demektir: /tefaskesif çıktısını getir',
             dilim: dilimler.length, hatalar: hatalar.slice(0, 3) }, 404);
-        return json({ fon: fon.toUpperCase(), tip, points, dilim: dilimler.length,
+        return json({ fon: fon.toUpperCase(), tip, ev, points, dilim: dilimler.length,
           hatalar: hatalar.length ? hatalar.slice(0, 3) : undefined });
       }
 
       return json({
         durum: 'Finans Motoru Worker', surum: SURUM,
-        uclar: ['/check', '/paket', '/seri?code=&start=', '/gruplar?kelime=', '/liste?grup=', '/yahoo?symbol=', '/tefas?fon=', '/temel?symbol=']
+        uclar: ['/check', '/paket', '/seri?code=&start=', '/gruplar?kelime=', '/liste?grup=', '/yahoo?symbol=', '/tefas?fon=', '/tefaskesif', '/tefasjs?js=', '/temel?symbol=']
       });
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);
