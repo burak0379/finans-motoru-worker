@@ -55,9 +55,23 @@ async function evdsSeri(code, start, end, env) {
   if (!env.EVDS_KEY) throw new Error('EVDS_KEY tanımlı değil — Worker ayarlarından ekle');
   const url = 'https://evds2.tcmb.gov.tr/service/evds/series=' + code +
     '&startDate=' + evdsTarih(start) + '&endDate=' + evdsTarih(end) + '&type=json';
-  const r = await fetch(url, { headers: { key: env.EVDS_KEY } });
-  if (!r.ok) throw new Error('EVDS HTTP ' + r.status + (r.status === 403 ? ' — anahtar geçersiz olabilir' : ''));
-  const d = await r.json();
+  const r = await fetch(url, {
+    headers: {
+      key: env.EVDS_KEY,
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'tr-TR,tr;q=0.9'
+    }
+  });
+  const govde = await r.text();
+  if (!r.ok) throw new Error('EVDS HTTP ' + r.status + (r.status === 403 ? ' — anahtar geçersiz olabilir' : '') +
+    ' · yanıt: ' + govde.slice(0, 160).replace(/\s+/g, ' '));
+  let d;
+  try { d = JSON.parse(govde); }
+  catch (e) {
+    /* EVDS JSON yerine sayfa döndü — teşhis için ilk satırları göster */
+    throw new Error('EVDS JSON dönmedi · yanıt başı: ' + govde.slice(0, 200).replace(/\s+/g, ' '));
+  }
   const items = d.items || [];
   const alan = code.replace(/[.\-]/g, '_'); // TP.FE.OKTG01 → TP_FE_OKTG01
   const points = [];
