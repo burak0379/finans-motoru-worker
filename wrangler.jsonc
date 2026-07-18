@@ -1,0 +1,6 @@
+// Cloudflare Workers derleme ayarı — GitHub'dan otomatik kurulum için
+{
+  "name": "finans-motoru-veri",
+  "main": "evds-worker.js",
+  "compatibility_date": "2025-01-01"
+}
