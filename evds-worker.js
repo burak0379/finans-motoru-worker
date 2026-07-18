@@ -51,6 +51,22 @@ const isoTarih = t => {
   return s;
 };
 
+async function evdsGet(pathQuery, env) {
+  if (!env.EVDS_KEY) throw new Error('EVDS_KEY tanımlı değil — Worker ayarlarından ekle');
+  const r = await fetch('https://evds3.tcmb.gov.tr/igmevdsms-dis/' + pathQuery, {
+    headers: {
+      key: env.EVDS_KEY,
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'tr-TR,tr;q=0.9'
+    }
+  });
+  const govde = await r.text();
+  if (!r.ok) throw new Error('EVDS HTTP ' + r.status + ' · ' + govde.slice(0, 120).replace(/\s+/g, ' '));
+  try { return JSON.parse(govde); }
+  catch (e) { throw new Error('EVDS JSON dönmedi · ' + govde.slice(0, 120).replace(/\s+/g, ' ')); }
+}
+
 async function evdsSeri(code, start, end, env) {
   if (!env.EVDS_KEY) throw new Error('EVDS_KEY tanımlı değil — Worker ayarlarından ekle');
   /* EVDS3 kontratı: path-stili URL (igmevdsms-dis), anahtar SADECE 'key' başlığında —
@@ -96,7 +112,7 @@ function yillikYuzde(points) {
   return out;
 }
 
-const SURUM = '2.4-igmevdsms';
+const SURUM = '2.5-katalog';
 
 export default {
   async fetch(req, env) {
@@ -145,6 +161,28 @@ export default {
         const end = url.searchParams.get('end') || bugun;
         const points = await evdsSeri(code, start, end, env);
         return json({ code, points });
+      }
+
+      /* ── /gruplar: veri gruplarını anahtar kelimeyle ara (seri kodu keşfi) ── */
+      if (yol === '/gruplar') {
+        const kelime = (url.searchParams.get('kelime') || '').toLocaleLowerCase('tr');
+        const d = await evdsGet('datagroups/mode=0&type=json', env);
+        const liste = (Array.isArray(d) ? d : (d.items || []))
+          .map(g => ({ kod: g.DATAGROUP_CODE, ad: g.DATAGROUP_NAME }))
+          .filter(g => g.kod && (!kelime || String(g.ad || '').toLocaleLowerCase('tr').includes(kelime)));
+        return json({ kelime, adet: liste.length, gruplar: liste.slice(0, 80),
+          not: 'Grubu seç → /liste?grup=GRUP_KODU ile serileri gör' });
+      }
+
+      /* ── /liste: bir gruptaki serileri kodlarıyla döker ── */
+      if (yol === '/liste') {
+        const grup = url.searchParams.get('grup');
+        if (!grup) return json({ error: 'grup parametresi gerekli (ör. /liste?grup=bie_dkdovytl)' }, 400);
+        const d = await evdsGet('serieList/type=json&code=' + encodeURIComponent(grup), env);
+        const liste = (Array.isArray(d) ? d : (d.items || []))
+          .map(x => ({ kod: x.SERIE_CODE, ad: x.SERIE_NAME, baslangic: x.START_DATE }))
+          .filter(x => x.kod);
+        return json({ grup, adet: liste.length, seriler: liste });
       }
 
       /* ── /yahoo: tek hisse OHLC (BIST: KOD.IS) — 2. teslimat kullanacak ── */
@@ -200,7 +238,7 @@ export default {
 
       return json({
         durum: 'Finans Motoru Worker', surum: SURUM,
-        uclar: ['/check', '/paket', '/seri?code=&start=', '/yahoo?symbol=', '/tefas?fon=']
+        uclar: ['/check', '/paket', '/seri?code=&start=', '/gruplar?kelime=', '/liste?grup=', '/yahoo?symbol=', '/tefas?fon=']
       });
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);
