@@ -6,7 +6,7 @@
    1. dash.cloudflare.com → Workers & Pages → Create Worker
    2. Bu dosyanın tamamını yapıştır → Deploy
    3. Settings → Variables → Add: EVDS_KEY = <EVDS API anahtarın>
-      (anahtar: evds2.tcmb.gov.tr → üye ol → profil → API Anahtarı)
+      (anahtar: evds3.tcmb.gov.tr → üye ol → profil → API Anahtarı)
    4. Worker adresini (https://....workers.dev) uygulamadaki
       "EVDS Worker adresi" alanına yapıştır.
    5. Tarayıcıda <worker-adresi>/check aç — her serinin durumunu görürsün.
@@ -53,7 +53,7 @@ const isoTarih = t => {
 
 async function evdsSeri(code, start, end, env) {
   if (!env.EVDS_KEY) throw new Error('EVDS_KEY tanımlı değil — Worker ayarlarından ekle');
-  const url = 'https://evds2.tcmb.gov.tr/service/evds/series=' + code +
+  const url = 'https://evds3.tcmb.gov.tr/service/evds/series=' + code +
     '&startDate=' + evdsTarih(start) + '&endDate=' + evdsTarih(end) + '&type=json';
   const r = await fetch(url, {
     headers: {
