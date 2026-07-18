@@ -35,7 +35,8 @@ const SERIES = {
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
   'Content-Type': 'application/json; charset=utf-8'
 };
 const json = (obj, status) =>
@@ -168,7 +169,30 @@ function temelAlanlar(qs) {
   };
 }
 
-const SURUM = '2.7.1-tefaskesif';
+/* ── FM-27: /ai — Gemini üzerinden sentez yorumu ──
+   Anahtar Cloudflare Secret'ta (GEMINI_KEY, aistudio.google.com'dan ücretsiz).
+   Model GEMINI_MODEL env ile değiştirilebilir. Uç yalnız izinli Origin'lerden
+   POST kabul eder — anahtar tarayıcıya asla inmez. */
+const AI_IZINLI = ['burak0379.github.io', 'localhost', '127.0.0.1'];
+const AI_SISTEM =
+  'Sen temkinli, dürüst bir Türk finans analistisin. Kurallar: ' +
+  '(1) YALNIZ sana verilen JSON verisindeki sayılardan konuş; dışarıdan bilgi, tahmin, şirket yorumu, verilmemiş rakam EKLEME. ' +
+  '(2) Kişiye özel yatırım tavsiyesi verme; "al/sat" deme — veriler ne diyorsa onu aktar, çelişkileri sakla(ma)dan söyle. ' +
+  '(3) 4-6 cümle, akıcı Türkçe, madde işareti kullanma. ' +
+  '(4) Olasılıkları kesinlik gibi sunma; belirsizliği koru. ' +
+  '(5) Veride null/eksik alan varsa o kanaldan söz ederken "veri yok" de, uydurma.';
+
+function geminiMetin(d){ /* yanıttan düz metin — saf, testte sınanır */
+  const c = d && d.candidates && d.candidates[0];
+  const parcalar = (c && c.content && c.content.parts) || [];
+  const metin = parcalar.map(p => p.text || '').join('').trim();
+  if(metin) return { metin };
+  const engel = (d && d.promptFeedback && d.promptFeedback.blockReason) || (c && c.finishReason);
+  return { hata: 'model metin döndürmedi' + (engel ? ' (' + engel + ')' : '') };
+}
+
+
+const SURUM = '2.8-ai';
 
 export default {
   async fetch(req, env) {
@@ -178,6 +202,45 @@ export default {
     const bugun = new Date().toISOString().slice(0, 10);
 
     try {
+      /* ── /ai: sentez yorumu (FM-27) — POST {baglam, gorev} ── */
+      if (yol === '/ai') {
+        if (req.method === 'GET')
+          return json({ uc: '/ai', anahtar: !!env.GEMINI_KEY, model: env.GEMINI_MODEL || 'gemini-2.5-flash',
+            not: 'POST {baglam, gorev} bekler; anahtar yoksa Cloudflare → Settings → Variables → GEMINI_KEY ekle (aistudio.google.com ücretsiz)' });
+        const origin = req.headers.get('Origin') || '';
+        if (origin && !AI_IZINLI.some(o => origin.includes(o)))
+          return json({ error: 'bu kaynaktan /ai kullanımı kapalı' }, 403);
+        if (!env.GEMINI_KEY)
+          return json({ error: 'GEMINI_KEY tanımlı değil — Cloudflare → Worker → Settings → Variables → Secret olarak ekle (anahtar: aistudio.google.com, ücretsiz)' }, 500);
+        let govde;
+        try { govde = await req.json(); } catch (e) { return json({ error: 'JSON gövde bekleniyor' }, 400); }
+        const baglam = typeof govde.baglam === 'string' ? govde.baglam : JSON.stringify(govde.baglam || {});
+        const gorev = String(govde.gorev || 'Bu verileri değerlendir.').slice(0, 500);
+        if (baglam.length > 20000) return json({ error: 'bağlam çok büyük' }, 400);
+        const model = env.GEMINI_MODEL || 'gemini-2.5-flash';
+        const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' +
+          encodeURIComponent(model) + ':generateContent?key=' + env.GEMINI_KEY, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: AI_SISTEM }] },
+            contents: [{ role: 'user', parts: [{ text: 'GÖREV: ' + gorev + '\n\nVERİ (JSON):\n' + baglam }] }],
+            generationConfig: { temperature: 0.4, maxOutputTokens: 500 }
+          })
+        });
+        const dMetin = await r.text();
+        if (!r.ok) {
+          const kisa = dMetin.slice(0, 200).replace(/\s+/g, ' ');
+          return json({ error: 'Gemini HTTP ' + r.status +
+            (r.status === 404 ? ' — model adı eskimiş olabilir; GEMINI_MODEL değişkeniyle güncelle' :
+             r.status === 429 ? ' — ücretsiz kota doldu, biraz sonra dene' : '') + ' · ' + kisa }, 502);
+        }
+        let d; try { d = JSON.parse(dMetin); } catch (e) { return json({ error: 'Gemini JSON dönmedi' }, 502); }
+        const sonuc = geminiMetin(d);
+        if (sonuc.hata) return json({ error: sonuc.hata }, 502);
+        return json({ metin: sonuc.metin, model });
+      }
+
       /* ── sağlık + kod doğrulama ── */
       if (yol === '/check') {
         const start = new Date(); start.setFullYear(start.getFullYear() - 2);
@@ -408,7 +471,7 @@ export default {
 
       return json({
         durum: 'Finans Motoru Worker', surum: SURUM,
-        uclar: ['/check', '/paket', '/seri?code=&start=', '/gruplar?kelime=', '/liste?grup=', '/yahoo?symbol=', '/tefas?fon=', '/tefaskesif', '/tefasjs?js=', '/temel?symbol=']
+        uclar: ['/ai', '/check', '/paket', '/seri?code=&start=', '/gruplar?kelime=', '/liste?grup=', '/yahoo?symbol=', '/tefas?fon=', '/tefaskesif', '/tefasjs?js=', '/temel?symbol=']
       });
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);
