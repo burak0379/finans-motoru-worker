@@ -198,6 +198,45 @@ function aiYansimaMi(m){
   return /"[a-zA-Z_]+"\s*:/.test(s) || /_yuzde/.test(s) || /^\s*[{\[]/.test(s) || s.length < 60;
 }
 
+/* ── Groq (yedek sağlayıcı, v2.9): OpenAI uyumlu uç ── */
+function groqMetin(d){
+  const m = d && d.choices && d.choices[0] && d.choices[0].message;
+  const metin = (m && m.content || '').trim();
+  return metin ? { metin } : { hata: 'Groq metin döndürmedi' };
+}
+function groqModelSec(modeller){
+  const adlar = (modeller || []).map(x => String(x.id || '')).filter(Boolean)
+    .filter(n => !/whisper|tts|guard|vision|audio/i.test(n));
+  if(!adlar.length) return null;
+  const tercih = adlar.filter(n => /llama/i.test(n) && /versatile|70b/i.test(n)).sort().reverse()[0];
+  return tercih || adlar.sort().reverse()[0];
+}
+let GROQ_MODEL_ON = null;
+async function groqCalistir(env, sistem, kullanici){
+  const uret = model => fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + env.GROQ_KEY },
+    body: JSON.stringify({ model,
+      messages: [{ role: 'system', content: sistem }, { role: 'user', content: kullanici }],
+      temperature: 0.4, max_tokens: 900 })
+  });
+  let model = env.GROQ_MODEL || GROQ_MODEL_ON || 'llama-3.3-70b-versatile';
+  let r = await uret(model);
+  if (r.status === 404 || r.status === 400) { /* model adı eskimiş olabilir → listeden seç */
+    const lr = await fetch('https://api.groq.com/openai/v1/models', { headers: { 'Authorization': 'Bearer ' + env.GROQ_KEY } });
+    if (lr.ok) {
+      const ld = await lr.json();
+      const yeniM = groqModelSec(ld.data);
+      if (yeniM && yeniM !== model) { model = GROQ_MODEL_ON = yeniM; r = await uret(model); }
+    }
+  }
+  const ham = await r.text();
+  if (!r.ok) throw new Error('Groq HTTP ' + r.status + (r.status === 429 ? ' (kota)' : '') + ' · ' + ham.slice(0, 160).replace(/\s+/g, ' '));
+  const s = groqMetin(JSON.parse(ham));
+  if (s.hata) throw new Error(s.hata);
+  return { metin: s.metin, model: 'groq:' + model };
+}
+
 /* model adları sık eskiyor (2.5-flash "no longer available" oldu) → Google'ın kendi
    listesinden güncel flash modelini keşfet; saf seçici testte sınanır */
 let AI_MODEL = null; // izolat önbelleği
@@ -211,6 +250,34 @@ function geminiModelSec(modeller){
   if(sabitTakma) return sabitTakma;
   return adaylar.sort().reverse()[0]; // gemini-3... > gemini-2.5... sözlük sırasıyla
 }
+async function geminiCalistir(env, kullanici){
+  const uret = async (model, dusunmesiz) => fetch('https://generativelanguage.googleapis.com/v1beta/models/' +
+    encodeURIComponent(model) + ':generateContent?key=' + env.GEMINI_KEY, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: AI_SISTEM }] },
+      contents: [{ role: 'user', parts: [{ text: kullanici }] }],
+      generationConfig: Object.assign(
+        { temperature: 0.4, maxOutputTokens: 2000 },
+        dusunmesiz ? {} : { thinkingConfig: { thinkingBudget: 0 } })
+    })
+  });
+  let model = env.GEMINI_MODEL || AI_MODEL || 'gemini-flash-latest';
+  let r = await uret(model, false);
+  if (r.status === 400) r = await uret(model, true);
+  if (r.status === 404) {
+    model = AI_MODEL = await geminiModelBul(env.GEMINI_KEY);
+    r = await uret(model, false);
+    if (r.status === 400) r = await uret(model, true);
+  }
+  const ham = await r.text();
+  if (!r.ok) throw new Error('Gemini HTTP ' + r.status + (r.status === 429 ? ' (günlük kota doldu)' : '') + ' · ' + ham.slice(0, 160).replace(/\s+/g, ' '));
+  const s = geminiMetin(JSON.parse(ham));
+  if (s.hata) throw new Error('Gemini: ' + s.hata);
+  return { metin: s.metin, model };
+}
+
 async function geminiModelBul(key){
   const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=' + key);
   if(!r.ok) throw new Error('model listesi alınamadı (HTTP ' + r.status + ')');
@@ -221,7 +288,7 @@ async function geminiModelBul(key){
 }
 
 
-const SURUM = '2.8.3-ai';
+const SURUM = '2.9-coklu-ai';
 
 export default {
   async fetch(req, env) {
@@ -231,73 +298,46 @@ export default {
     const bugun = new Date().toISOString().slice(0, 10);
 
     try {
-      /* ── /ai: sentez yorumu (FM-27) — POST {baglam, gorev} ── */
+      /* ── /ai: sentez yorumu (v2.9 — sağlayıcı şelalesi: Gemini → Groq) ── */
       if (yol === '/ai') {
         if (req.method === 'GET')
-          return json({ uc: '/ai', anahtar: !!env.GEMINI_KEY, model: env.GEMINI_MODEL || AI_MODEL || 'otomatik keşif (flash-latest)',
-            not: 'POST {baglam, gorev} bekler; anahtar yoksa Cloudflare → Settings → Variables → GEMINI_KEY ekle (aistudio.google.com ücretsiz)' });
+          return json({ uc: '/ai', gemini: !!env.GEMINI_KEY, groq: !!env.GROQ_KEY,
+            not: 'POST {baglam, gorev}; Gemini kota dolarsa GROQ_KEY tanımlıysa Groq devralır (console.groq.com, ücretsiz)' });
         const origin = req.headers.get('Origin') || '';
         if (origin && !AI_IZINLI.some(o => origin.includes(o)))
           return json({ error: 'bu kaynaktan /ai kullanımı kapalı' }, 403);
-        if (!env.GEMINI_KEY)
-          return json({ error: 'GEMINI_KEY tanımlı değil — Cloudflare → Worker → Settings → Variables → Secret olarak ekle (anahtar: aistudio.google.com, ücretsiz)' }, 500);
+        if (!env.GEMINI_KEY && !env.GROQ_KEY)
+          return json({ error: 'AI anahtarı yok — Cloudflare Secrets: GEMINI_KEY (aistudio.google.com) ve/veya GROQ_KEY (console.groq.com), ikisi de ücretsiz' }, 500);
         let govde;
         try { govde = await req.json(); } catch (e) { return json({ error: 'JSON gövde bekleniyor' }, 400); }
         const baglam = typeof govde.baglam === 'string' ? govde.baglam : JSON.stringify(govde.baglam || {});
         const gorev = String(govde.gorev || 'Bu verileri değerlendir.').slice(0, 500);
         if (baglam.length > 20000) return json({ error: 'bağlam çok büyük' }, 400);
-        const uret = async (model, dusunmesiz) => fetch('https://generativelanguage.googleapis.com/v1beta/models/' +
-          encodeURIComponent(model) + ':generateContent?key=' + env.GEMINI_KEY, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: AI_SISTEM }] },
-            contents: [{ role: 'user', parts: [{ text: 'GÖREV: ' + gorev + '\n\nVERİ (JSON):\n' + baglam + '\n\nYANIT BİÇİMİ: yalnız düz yazı, tek paragraf. Veriyi geri yazma.' }] }],
-            generationConfig: Object.assign(
-              { temperature: 0.4, maxOutputTokens: 2000 },
-              /* yeni flash modelleri "düşünme"ye bütçeden token harcıyor ve görünür
-                 metin yarıda kesiliyordu → düşünmeyi kapat; model tanımıyorsa
-                 (400) aynı istek thinkingConfig'siz yinelenir */
-              dusunmesiz ? {} : { thinkingConfig: { thinkingBudget: 0 } }
-            )
-          })
-        });
-        let model = env.GEMINI_MODEL || AI_MODEL || 'gemini-flash-latest';
-        let r = await uret(model, false);
-        if (r.status === 400) r = await uret(model, true);
-        if (r.status === 404) { /* isim eskimiş → listeden güncelini keşfet, bir kez yeniden dene */
-          model = AI_MODEL = await geminiModelBul(env.GEMINI_KEY);
-          r = await uret(model, false);
-          if (r.status === 400) r = await uret(model, true);
+        const kullanici = 'GÖREV: ' + gorev + '\n\nVERİ (JSON):\n' + baglam + '\n\nYANIT BİÇİMİ: yalnız düz yazı, tek paragraf. Veriyi geri yazma.';
+        const sertKullanici = 'Aşağıdaki veriyi KOPYALAMADAN, tek paragraf akıcı Türkçe düz yazıyla yorumla. JSON yazmak YASAK.\n\n' + baglam;
+        const hatalar = [];
+        /* 1. basamak: Gemini */
+        if (env.GEMINI_KEY) {
+          try {
+            let s = await geminiCalistir(env, kullanici);
+            if (aiYansimaMi(s.metin)) s = await geminiCalistir(env, sertKullanici);
+            if (!aiYansimaMi(s.metin)) return json({ metin: s.metin, model: s.model + ' · w' + SURUM });
+            hatalar.push('Gemini: veriyi yansıttı');
+          } catch (e) { hatalar.push(String(e.message || e)); }
         }
-        const dMetin = await r.text();
-        if (!r.ok) {
-          const kisa = dMetin.slice(0, 200).replace(/\s+/g, ' ');
-          return json({ error: 'Gemini HTTP ' + r.status +
-            (r.status === 404 ? ' — model bulunamadı; keşif de başarısızsa GEMINI_MODEL değişkeniyle elle belirt' :
-             r.status === 429 ? ' — ücretsiz kota doldu, biraz sonra dene' : '') + ' · ' + kisa }, 502);
+        /* 2. basamak: Groq */
+        if (env.GROQ_KEY) {
+          try {
+            let s = await groqCalistir(env, AI_SISTEM, kullanici);
+            if (aiYansimaMi(s.metin)) s = await groqCalistir(env, AI_SISTEM, sertKullanici);
+            if (!aiYansimaMi(s.metin)) return json({ metin: s.metin, model: s.model + ' · w' + SURUM });
+            hatalar.push('Groq: veriyi yansıttı');
+          } catch (e) { hatalar.push(String(e.message || e)); }
         }
-        let d; try { d = JSON.parse(dMetin); } catch (e) { return json({ error: 'Gemini JSON dönmedi' }, 502); }
-        let sonuc = geminiMetin(d);
-        /* yansıma koruması: model düz yazı yerine veri paketini geri yazdıysa bir kez sert talimatla yinele */
-        if (!sonuc.hata && aiYansimaMi(sonuc.metin)) {
-          const r2 = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' +
-            encodeURIComponent(model) + ':generateContent?key=' + env.GEMINI_KEY, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text: AI_SISTEM }] },
-              contents: [{ role: 'user', parts: [{ text: 'Aşağıdaki veriyi KOPYALAMADAN, tek paragraf akıcı Türkçe düz yazıyla yorumla. JSON yazmak YASAK.\n\n' + baglam }] }],
-              generationConfig: { temperature: 0.4, maxOutputTokens: 2000 }
-            })
-          });
-          try { sonuc = geminiMetin(JSON.parse(await r2.text())); } catch (e) { /* ilk sonuç kalır */ }
-          if (!sonuc.hata && aiYansimaMi(sonuc.metin)) sonuc = { hata: 'model veriyi yansıttı — tekrar dene' };
-        }
-        if (sonuc.hata) return json({ error: sonuc.hata }, 502);
-        return json({ metin: sonuc.metin, model: model + ' · w' + SURUM });
+        return json({ error: hatalar.join(' — ') || 'sağlayıcı yok', ipucu: env.GROQ_KEY ? undefined :
+          'Gemini kotası dolduysa: console.groq.com ücretsiz anahtar → Cloudflare GROQ_KEY Secret — worker kendiliğinden devreder' }, 502);
       }
 
-      /* ── sağlık + kod doğrulama ── */
       if (yol === '/check') {
         const start = new Date(); start.setFullYear(start.getFullYear() - 2);
         const out = {};
