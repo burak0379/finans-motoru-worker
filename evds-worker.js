@@ -53,7 +53,9 @@ const isoTarih = t => {
 
 async function evdsSeri(code, start, end, env) {
   if (!env.EVDS_KEY) throw new Error('EVDS_KEY tanımlı değil — Worker ayarlarından ekle');
-  const url = 'https://evds3.tcmb.gov.tr/service/evds/series=' + code +
+  /* EVDS3 kontratı: path-stili URL (igmevdsms-dis), anahtar SADECE 'key' başlığında —
+     URL'ye key eklemek ya da klasik query-string kullanmak 403/404 verir */
+  const url = 'https://evds3.tcmb.gov.tr/igmevdsms-dis/series=' + code +
     '&startDate=' + evdsTarih(start) + '&endDate=' + evdsTarih(end) + '&type=json';
   const r = await fetch(url, {
     headers: {
@@ -94,6 +96,8 @@ function yillikYuzde(points) {
   return out;
 }
 
+const SURUM = '2.4-igmevdsms';
+
 export default {
   async fetch(req, env) {
     if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
@@ -114,7 +118,7 @@ export default {
               : { ok: false, code: s.code, hata: 'seri boş — kod yanlış olabilir' };
           } catch (e) { out[ad] = { ok: false, code: s.code, hata: String(e.message || e) }; }
         }
-        return json({ durum: 'çalışıyor', anahtar: !!env.EVDS_KEY, seriler: out });
+        return json({ durum: 'çalışıyor', surum: SURUM, anahtar: !!env.EVDS_KEY, seriler: out });
       }
 
       /* ── /paket: uygulamadaki hızlı son-değer çekimi (eski uçla uyumlu) ── */
@@ -195,7 +199,7 @@ export default {
       }
 
       return json({
-        durum: 'Finans Motoru Worker v2',
+        durum: 'Finans Motoru Worker', surum: SURUM,
         uclar: ['/check', '/paket', '/seri?code=&start=', '/yahoo?symbol=', '/tefas?fon=']
       });
     } catch (e) {
