@@ -4,3 +4,6 @@
   "main": "evds-worker.js",
   "compatibility_date": "2025-01-01"
 }
+[[kv_namespaces]]
+binding = "FM_KV"
+id = "KOPYALADIĞIN_ID"
